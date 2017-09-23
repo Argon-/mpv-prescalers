@@ -126,14 +126,14 @@ class NNEDI3(userhook.UserHook):
               x + y * self.window_width
         return self.weight_at(ptr)
 
-    def weightWS(self, n, s, i):
+    def weightWS(self, n, i):
         window_size = self.window_width * self.window_height
         ptr = self.offset + \
               (window_size * 2 + 4) * n + window_size * 2 + \
               i
         return self.weight_at(ptr)
 
-    def generate(self, step, use_gather=False, use_compute=False, compute_shader_block_size=None):
+    def generate(self, step, use_gather=False, use_compute=False, compute_shader_block_size=None, use_buffer=None):
         self.load_weights()
         self.reset()
         GLSL = self.add_glsl
@@ -162,7 +162,8 @@ class NNEDI3(userhook.UserHook):
             #      "error C5213: Component must be a constant in the range [0..3]"
             #   3. regular version is too slow without inlining
             #
-            GLSL('#pragma optionNV(inline none)')
+            if not use_buffer:
+                GLSL('#pragma optionNV(inline none)')
 
         self.set_description("NNEDI3 (%s, %s, nns%d, win%dx%d)" %
                              (step.name, self.profile.name, self.neurons, width, height))
@@ -271,8 +272,48 @@ float mstd1 = sumsq / %d.0 - mstd0 * mstd0;
 float mstd2 = mix(0.0, inversesqrt(mstd1), mstd1 >= %s);
 mstd1 *= mstd2;""" % (width * height, width * height, "1.192092896e-7"))
 
-        GLSL("""
-float vsum = 0.0, wsum = 0.0, sum1, sum2;
+        GLSL("float vsum = 0.0, wsum = 0.0, sum1, sum2;")
+
+        if use_buffer:
+            import struct
+
+            weights_layout = "vec4 w1[%d][%d], w2[%d][%d], ws[%d];" % (
+                self.neurons, sample_count, self.neurons, sample_count, self.neurons)
+
+            weights_binding_name = "nnedi3_weights_nns%d_win%dx%d_%s" % (
+                self.neurons, width, height, step.name)
+
+            weights_w1 = []
+            weights_w2 = []
+            weights_ws = []
+
+            for n in range(self.neurons):
+                for i in range(sample_count):
+                    global_pos, window_pos = sampling_info[i]
+                    for x, y in window_pos:
+                        weights_w1.append(self.weightW(n, 0, x, y))
+                        weights_w2.append(self.weightW(n, 1, x, y))
+                weights_ws.extend([self.weightWS(n, 0), self.weightWS(n, 1), 0, 0])
+
+            weights_all = weights_w1 + weights_w2 + weights_ws
+            weights_raw = struct.pack('<%di' % len(weights_all), *weights_all).hex()
+
+            GLSL("""
+for (int n = 0; n < %d; n++) {
+    sum1 = 0;
+    sum2 = 0;
+    for (int i = 0; i < %d; i++) {
+        sum1 += dot(samples[i], w1[n][i]);
+        sum2 += dot(samples[i], w2[n][i]);
+    }
+    sum1 = exp(sum1 * mstd2 + ws[n][0]);
+    sum2 = sum2 * mstd2 + ws[n][1];
+    wsum += sum1;
+    vsum += sum1*(sum2/(1.0+abs(sum2)));
+}""" % (self.neurons, sample_count))
+
+        else:
+            GLSL("""
 #define T(x) intBitsToFloat(x)
 #define W(i,w0,w1,w2,w3) dot(samples[i],vec4(T(w0),T(w1),T(w2),T(w3)))
 #define WS(w0,w1) \
@@ -281,22 +322,22 @@ sum2 = sum2 * mstd2 + T(w1); \
 wsum += sum1; \
 vsum += sum1*(sum2/(1.0+abs(sum2)));""")
 
-        for n in range(self.neurons):
-            line = []
-            for s in range(2):
-                line.append("sum%d" % (s + 1))
-                for i in range(sample_count):
-                    global_pos, window_pos = sampling_info[i]
-                    weights = []
-                    for x, y in window_pos:
-                        weights.append(self.weightW(n, s, x, y))
-                    line.append("%sW(%d,%d,%d,%d,%d)" % (
-                        "=" if i == 0 else "+",
-                        i, weights[0], weights[1], weights[2], weights[3]))
-                line.append(";")
-            line.append("WS(%d,%d);" %
-                        (self.weightWS(n, s, 0), self.weightWS(n, s, 1)))
-            GLSL("".join(line))
+            for n in range(self.neurons):
+                line = []
+                for s in range(2):
+                    line.append("sum%d" % (s + 1))
+                    for i in range(sample_count):
+                        global_pos, window_pos = sampling_info[i]
+                        weights = []
+                        for x, y in window_pos:
+                            weights.append(self.weightW(n, s, x, y))
+                        line.append("%sW(%d,%d,%d,%d,%d)" % (
+                            "=" if i == 0 else "+",
+                            i, weights[0], weights[1], weights[2], weights[3]))
+                    line.append(";")
+                line.append("WS(%d,%d);" %
+                            (self.weightWS(n, 0), self.weightWS(n, 1)))
+                GLSL("".join(line))
 
         GLSL("""
 return clamp(mstd0 + 5.0 * vsum / wsum * mstd1, 0.0, 1.0);
@@ -373,6 +414,14 @@ for (int id = int(gl_LocalInvocationIndex); id < %d; id += int(gl_WorkGroupSize.
         GLSL("""
 }  // hook""")
 
+        if use_buffer:
+            self.bind_tex(weights_binding_name)
+
+            GLSL("//!BUFFER %s" % weights_binding_name)
+            GLSL("//!TYPE %s" % ("STORAGE" if use_buffer == "ssbo" else "UNIFORM"))
+            GLSL("//!LAYOUT %s" % weights_layout)
+            GLSL(weights_raw)
+
         return super().generate()
 
 
@@ -424,17 +473,20 @@ if __name__ == "__main__":
     parser.add_argument('--use-gather',
                         action='store_true',
                         help="enable use of textureGatherOffset (requires OpenGL 4.0)")
-    parser.add_argument(
-        '--use-compute-shader',
-        action='store_true',
-        help="enable use of compute shader (requires OpenGL 4.3)")
-    parser.add_argument(
-        '--compute-shader-block-size',
-        nargs=2,
-        metavar=('block_width', 'block_height'),
-        default=[32, 8],
-        type=int,
-        help='specify the block size of compute shader (default: 32 8)')
+    parser.add_argument('--use-compute-shader',
+                        action='store_true',
+                        help="enable use of compute shader (requires OpenGL 4.3)")
+    parser.add_argument('--compute-shader-block-size',
+                        nargs=2,
+                        metavar=('block_width', 'block_height'),
+                        default=[32, 8],
+                        type=int,
+                        help='specify the block size of compute shader (default: 32 8)')
+    parser.add_argument('--use-buffer-object',
+                        nargs=1,
+                        choices=["ubo", "ssbo"],
+                        default=[None],
+                        help="enable use of UBO/SSBO (default: none)")
 
     args = parser.parse_args()
     hook, profile = profile_mapping[args.target[0]]
@@ -444,6 +496,7 @@ if __name__ == "__main__":
     use_gather = args.use_gather
     use_compute = args.use_compute_shader
     compute_shader_block_size = args.compute_shader_block_size
+    use_buffer = args.use_buffer_object[0]
 
     target_tex = "LUMA" if profile == Profile.chroma else "OUTPUT"
     gen = NNEDI3(profile,
@@ -459,4 +512,5 @@ if __name__ == "__main__":
             step,
             use_gather=use_gather,
             use_compute=use_compute,
-            compute_shader_block_size=compute_shader_block_size))
+            compute_shader_block_size=compute_shader_block_size,
+            use_buffer=use_buffer))
