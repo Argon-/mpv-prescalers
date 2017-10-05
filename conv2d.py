@@ -95,7 +95,7 @@ class Conv2D_3x3(userhook.UserHook):
         assert self.input_channels == 4
         assert self.output_channels == 4
 
-        group_size = 2
+        group_size = 4
         self.set_compute(block_size[0] * group_size, block_size[1] * group_size,
                          block_size[0], block_size[1])
 
@@ -128,8 +128,8 @@ class Conv2D_3x3(userhook.UserHook):
 
         samples = {}
 
-        for i in range(4):
-            for j in range(4):
+        for i in range(group_size + 2):
+            for j in range(group_size + 2):
                 sample_name = "inp%d%d" % (i, j)
                 samples[i, j] = sample_name
                 GLSL("vec4 %s = HOOKED_mul * texelFetch(HOOKED_raw, group_base + ivec2(%d, %d), 0);" %
@@ -145,19 +145,24 @@ class Conv2D_3x3(userhook.UserHook):
                 tmp_name = "tmp%d%d" % (i, j)
                 tmps[i, j] = tmp_name
 
-                sample_summed = ""
-                for u in range(4):
-                    for v in range(4):
-                        val = BTiB[i, j, u, v]
-                        if val != 0:
-                            sample_summed += '+' if val > 0 else '-'
-                            sample_summed += samples[u, v]
+                ma2 = []
+                for idx in range(4):
+                    sample_summed = ""
+                    for u in range(4):
+                        for v in range(4):
+                            val = BTiB[i, j, u, v]
+                            if val != 0:
+                                sample_summed += '+' if val > 0 else '-'
+                                sample_summed += samples[u + (idx // 2) * 2, v + (idx % 2) * 2]
 
-                sample_summed = sample_summed.lstrip('+')
+                    sample_summed = sample_summed.lstrip('+')
+                    ma2.append(sample_summed)
+
+                ma2 = "mat4(%s)" % ",".join(ma2)
 
                 ma = "mat4(%s)" % ",".join(repr(e) for e in GgGT[i, j].T.ravel())
 
-                GLSL("vec4 %s = %s * (%s);" % (tmp_name, ma, sample_summed))
+                GLSL("mat4 %s = %s * %s;" % (tmp_name, ma, ma2))
 
         if bias is not None:
             GLSL("vec4 bias = vec4(%s);" % ",".join(repr(e) for e in bias))
@@ -167,7 +172,7 @@ class Conv2D_3x3(userhook.UserHook):
                 tmp_summed = ""
 
                 if bias is not None:
-                    tmp_summed += "bias"
+                    tmp_summed += "mat4(bias, bias, bias, bias)"
 
                 for u in range(4):
                     for v in range(4):
@@ -178,7 +183,12 @@ class Conv2D_3x3(userhook.UserHook):
 
                 tmp_summed = tmp_summed.lstrip('+')
 
-                GLSL("imageStore(out_image, group_base + ivec2(%d, %d), %s);" % (i, j, tmp_summed))
+                result_name = "res%d%d" % (i, j)
+
+                GLSL("mat4 %s = %s;" % (result_name, tmp_summed))
+
+                for idx in range(4):
+                    GLSL("imageStore(out_image, group_base + ivec2(%d, %d), %s[%d]);" % (i + (idx // 2) * 2, j + (idx % 2) * 2, result_name, idx))
 
         GLSL("}")
 
@@ -203,8 +213,8 @@ class Compare(userhook.UserHook):
         GLSL("float diff = distance(%s_texOff(vec2(0.0)), %s_texOff(vec2(0.0)));" % (input1, input2))
 
         GLSL("""
-if (diff < 0.001) return vec4(1.0, 0.0, 0.0, 0.0);
-if (diff < 0.1) return vec4(0.0, 1.0, 0.0, 0.0);
+if (diff < 0.000001) return vec4(1.0, 0.0, 0.0, 0.0);
+if (diff < 0.01) return vec4(0.0, 1.0, 0.0, 0.0);
 return vec4(0.0, 0.0, 1.0, 0.0);
         """)
 
