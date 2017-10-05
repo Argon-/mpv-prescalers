@@ -68,7 +68,8 @@ class UserHook:
         self.mappings = None
 
     def bind_tex(self, tex):
-        self.header[BIND].append(tex)
+        if tex not in self.header[BIND]:
+            self.header[BIND].append(tex)
 
     def save_tex(self, tex):
         self.header[SAVE] = tex
@@ -97,6 +98,10 @@ class UserHook:
             self.header[HEIGHT] = "%d %s.h *" % (mul_y, HOOKED)
         if offset_x != 0.0 or offset_y != 0.0:
             self.header[OFFSET] = ["%f %f" % (offset_x, offset_y)]
+
+    def set_output_size(self, output_width, output_height):
+        self.header[WIDTH] = output_width
+        self.header[HEIGHT] = output_height
 
     # Use this with caution. This will skip only current step.
     def set_skippable(self, mul_x=0, mul_y=0, source_tex=HOOKED):
